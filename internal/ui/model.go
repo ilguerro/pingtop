@@ -125,7 +125,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case msg.LastErr != nil:
 			appendHistory(m.history, msg.TargetID, sparkErr)
 		case msg.Timeout:
-			appendHistory(m.history, msg.TargetID, sparkTimeout)
+			appendHistory(m.history, msg.TargetID, timeoutSample(m.history[msg.TargetID]))
 		}
 		return m, m.waitForUpdate()
 
@@ -748,7 +748,7 @@ var sparkBars = []rune("▁▂▃▄▅▆▇█")
 // History sentinels for probes that produced no RTT. Real RTT samples
 // are always > 0.
 const (
-	sparkErr     time.Duration = -1 // failed with a network error
+	sparkErr     time.Duration = -1 // failed with a network error, or a confirmed run of timeouts
 	sparkTimeout time.Duration = -2 // went unanswered; may be a one-off loss
 )
 
@@ -758,6 +758,25 @@ const (
 	sparkErrPlain     = "×"
 	sparkTimeoutPlain = "?"
 )
+
+// sparkTimeoutEscalate is how many probes in a row must go without an
+// RTT before a timeout stops being a suspected one-off and is recorded
+// as sparkErr.
+const sparkTimeoutEscalate = 3
+
+// timeoutSample picks the sentinel for a new timeout given the history
+// so far: sparkTimeout while the gap is short, sparkErr once this is
+// the sparkTimeoutEscalate-th miss in a row.
+func timeoutSample(history []time.Duration) time.Duration {
+	run := 1
+	for i := len(history) - 1; i >= 0 && history[i] <= 0; i-- {
+		run++
+	}
+	if run >= sparkTimeoutEscalate {
+		return sparkErr
+	}
+	return sparkTimeout
+}
 
 func appendHistory(h map[string][]time.Duration, id string, rtt time.Duration) {
 	buf := h[id]

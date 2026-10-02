@@ -2,6 +2,7 @@ package ui
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -477,6 +478,34 @@ func TestUpdateAppendsSparkTimeout(t *testing.T) {
 	out := mm.(Model)
 	if len(out.history["1.1.1.1"]) != 1 || out.history["1.1.1.1"][0] != sparkTimeout {
 		t.Errorf("expected one sparkTimeout sample, got %v", out.history["1.1.1.1"])
+	}
+}
+
+func TestUpdateEscalatesRepeatedTimeouts(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate, 4)
+	var tm tea.Model = New([]string{"1.1.1.1"}, updates, false, false)
+
+	tm, _ = tm.Update(statsMsg{TargetID: "1.1.1.1", Sent: 1, Recv: 1, RTT: time.Millisecond})
+	for i := 0; i < sparkTimeoutEscalate+1; i++ {
+		tm, _ = tm.Update(statsMsg{TargetID: "1.1.1.1", Timeout: true})
+	}
+	// A reply ends the run, so the next miss is only suspected again.
+	tm, _ = tm.Update(statsMsg{TargetID: "1.1.1.1", RTT: time.Millisecond})
+	tm, _ = tm.Update(statsMsg{TargetID: "1.1.1.1", Timeout: true})
+
+	want := []time.Duration{time.Millisecond}
+	for i := 1; i <= sparkTimeoutEscalate+1; i++ {
+		if i < sparkTimeoutEscalate {
+			want = append(want, sparkTimeout)
+		} else {
+			want = append(want, sparkErr)
+		}
+	}
+	want = append(want, time.Millisecond, sparkTimeout)
+
+	got := tm.(Model).history["1.1.1.1"]
+	if !slices.Equal(got, want) {
+		t.Errorf("history mismatch\n got=%v\nwant=%v", got, want)
 	}
 }
 
