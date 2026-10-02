@@ -364,6 +364,34 @@ func TestFormatSparkErrColored(t *testing.T) {
 	}
 }
 
+func TestFormatSparkTimeoutPlain(t *testing.T) {
+	h := []time.Duration{1 * time.Millisecond, sparkTimeout, 100 * time.Millisecond}
+	runes := []rune(formatSpark(h, sparkWidth, styler{}))
+	last3 := runes[len(runes)-3:]
+	if last3[0] != sparkBars[0] || last3[2] != sparkBars[len(sparkBars)-1] {
+		t.Errorf("timeout sample should not skew scaling, got %q", string(last3))
+	}
+	if string(last3[1]) != sparkTimeoutPlain {
+		t.Errorf("timeout sample should render as %q, got %c", sparkTimeoutPlain, last3[1])
+	}
+}
+
+func TestFormatSparkTimeoutColored(t *testing.T) {
+	old := lipgloss.DefaultRenderer().ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI)
+	defer lipgloss.SetColorProfile(old)
+
+	st := newStyler(true)
+	got := formatSpark([]time.Duration{10 * time.Millisecond, sparkTimeout}, sparkWidth, st)
+	full := string(sparkBars[len(sparkBars)-1])
+	if !strings.HasSuffix(got, st.render(full, levelWarn)) {
+		t.Errorf("timeout sample should render as a warn-colored full bar, got %q", got)
+	}
+	if w := lipgloss.Width(got); w != sparkWidth {
+		t.Errorf("colored spark should still be %d cells wide, got %d", sparkWidth, w)
+	}
+}
+
 func TestAppendHistoryRingBuffer(t *testing.T) {
 	h := make(map[string][]time.Duration)
 	for i := 0; i < maxSparkWidth+5; i++ {
