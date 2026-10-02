@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	probing "github.com/prometheus-community/pro-bing"
@@ -150,6 +151,16 @@ func (p *Pinger) Run(ctx context.Context) error {
 		p.emit(pCtx, snapshot(0, err))
 	}
 	pp.OnSendError = func(_ *probing.Packet, err error) {
+		// pro-bing retries ENOBUFS immediately in a tight loop, so it
+		// isn't a lost probe yet.
+		if errors.Is(err, syscall.ENOBUFS) {
+			return
+		}
+		// A probe that never left the host is still a lost probe:
+		// count it so loss% keeps moving during an outage. The drop
+		// check stays in OnSend so a local network failure never
+		// evicts targets.
+		sent.Add(1)
 		p.emit(pCtx, snapshot(0, err))
 	}
 
