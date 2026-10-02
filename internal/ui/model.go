@@ -124,6 +124,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			appendHistory(m.history, msg.TargetID, msg.RTT)
 		case msg.LastErr != nil:
 			appendHistory(m.history, msg.TargetID, sparkErr)
+		case msg.Timeout:
+			appendHistory(m.history, msg.TargetID, sparkTimeout)
 		}
 		return m, m.waitForUpdate()
 

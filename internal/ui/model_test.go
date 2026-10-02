@@ -469,6 +469,17 @@ func TestUpdateAppendsSparkErrOnError(t *testing.T) {
 	}
 }
 
+func TestUpdateAppendsSparkTimeout(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate, 4)
+	m := New([]string{"1.1.1.1"}, updates, false, false)
+
+	mm, _ := m.Update(statsMsg{TargetID: "1.1.1.1", Sent: 1, Timeout: true})
+	out := mm.(Model)
+	if len(out.history["1.1.1.1"]) != 1 || out.history["1.1.1.1"][0] != sparkTimeout {
+		t.Errorf("expected one sparkTimeout sample, got %v", out.history["1.1.1.1"])
+	}
+}
+
 func TestViewWhenAllTargetsDropped(t *testing.T) {
 	updates := make(chan pinger.StatsUpdate, 4)
 	m := New([]string{"1.1.1.1"}, updates, false, false)
