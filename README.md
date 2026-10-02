@@ -35,7 +35,11 @@ pingtop 1.1.1.1 8.8.8.8 example.com
 
 Each row updates once per second with the latest RTT, smoothed jitter
 (RFC 3550), packet loss, sent/lost count, and a sparkline of recent RTTs scaled
-per-target so relative variance is visible.
+per-target so relative variance is visible. A probe that fails with a network
+error (interface down, network unreachable) shows as a red bar on the sparkline
+(`×` with `--no-color`), and the target picks up again once the network is back.
+A probe that simply gets no reply shows as a yellow bar (`?`); from the third
+miss in a row the bars turn red.
 
 ### Scan a subnet and prune unreachable hosts
 

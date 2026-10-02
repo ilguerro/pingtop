@@ -119,8 +119,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.waitForUpdate()
 		}
 		m.stats[msg.TargetID] = pinger.StatsUpdate(msg)
-		if msg.RTT > 0 {
+		switch {
+		case msg.RTT > 0:
 			appendHistory(m.history, msg.TargetID, msg.RTT)
+		case msg.LastErr != nil:
+			appendHistory(m.history, msg.TargetID, sparkErr)
+		case msg.Timeout:
+			appendHistory(m.history, msg.TargetID, timeoutSample(m.history[msg.TargetID]))
 		}
 		return m, m.waitForUpdate()
 
@@ -394,7 +399,7 @@ func buildRows(order []string, stats map[string]pinger.StatsUpdate, history map[
 	for i, id := range order {
 		s, ok := stats[id]
 		if !ok {
-			rows[i] = []string{id, "—", "—", "—", "—", "—", "—", "—", formatSpark(nil, sparkW)}
+			rows[i] = []string{id, "—", "—", "—", "—", "—", "—", "—", formatSpark(nil, sparkW, st)}
 			continue
 		}
 		rows[i] = []string{
@@ -406,7 +411,7 @@ func buildRows(order []string, stats map[string]pinger.StatsUpdate, history map[
 			st.render(formatJitter(s), jitterLevel(s)),
 			st.render(formatLoss(s), lossLevel(s)),
 			formatSentLost(s),
-			formatSpark(history[id], sparkW),
+			formatSpark(history[id], sparkW, st),
 		}
 	}
 	return rows
@@ -740,6 +745,39 @@ const maxSparkWidth = 200
 // sparkBars is the 8-level Unicode bar set used to render samples.
 var sparkBars = []rune("▁▂▃▄▅▆▇█")
 
+// History sentinels for probes that produced no RTT. Real RTT samples
+// are always > 0.
+const (
+	sparkErr     time.Duration = -1 // failed with a network error, or a confirmed run of timeouts
+	sparkTimeout time.Duration = -2 // went unanswered; may be a one-off loss
+)
+
+// Markers for sentinel samples when color is off, where a full-height
+// bar would be indistinguishable from a slow reply.
+const (
+	sparkErrPlain     = "×"
+	sparkTimeoutPlain = "?"
+)
+
+// sparkTimeoutEscalate is how many probes in a row must go without an
+// RTT before a timeout stops being a suspected one-off and is recorded
+// as sparkErr.
+const sparkTimeoutEscalate = 3
+
+// timeoutSample picks the sentinel for a new timeout given the history
+// so far: sparkTimeout while the gap is short, sparkErr once this is
+// the sparkTimeoutEscalate-th miss in a row.
+func timeoutSample(history []time.Duration) time.Duration {
+	run := 1
+	for i := len(history) - 1; i >= 0 && history[i] <= 0; i-- {
+		run++
+	}
+	if run >= sparkTimeoutEscalate {
+		return sparkErr
+	}
+	return sparkTimeout
+}
+
 func appendHistory(h map[string][]time.Duration, id string, rtt time.Duration) {
 	buf := h[id]
 	if len(buf) >= maxSparkWidth {
@@ -752,8 +790,11 @@ func appendHistory(h map[string][]time.Duration, id string, rtt time.Duration) {
 // scaled per-target between the window's min and max so relative
 // jitter is what's visible. Pads with leading spaces until the buffer
 // fills, so the latest sample is always at the right edge. width sets
-// the rendered column width (number of bar cells).
-func formatSpark(history []time.Duration, width int) string {
+// the rendered column width (number of bar cells). Sentinel samples
+// are left out of the scaling and drawn as a full-height bar in st's
+// crit (sparkErr) or warn (sparkTimeout) color, or as their plain
+// marker when st is disabled.
+func formatSpark(history []time.Duration, width int, st styler) string {
 	if width <= 0 {
 		width = sparkWidth
 	}
@@ -763,16 +804,28 @@ func formatSpark(history []time.Duration, width int) string {
 	if len(history) > width {
 		history = history[len(history)-width:]
 	}
-	min, max := history[0], history[0]
-	for _, d := range history[1:] {
-		if d < min {
+	var min, max time.Duration
+	seen := false
+	for _, d := range history {
+		if d <= 0 {
+			continue
+		}
+		if !seen || d < min {
 			min = d
 		}
-		if d > max {
+		if !seen || d > max {
 			max = d
 		}
+		seen = true
 	}
 	rng := max - min
+
+	errBar, timeoutBar := sparkErrPlain, sparkTimeoutPlain
+	if st.enabled {
+		full := string(sparkBars[len(sparkBars)-1])
+		errBar = st.render(full, levelCrit)
+		timeoutBar = st.render(full, levelWarn)
+	}
 
 	var b strings.Builder
 	b.Grow(width * 4) // bars are 3-byte UTF-8 runes
@@ -780,6 +833,14 @@ func formatSpark(history []time.Duration, width int) string {
 		b.WriteByte(' ')
 	}
 	for _, d := range history {
+		switch d {
+		case sparkErr:
+			b.WriteString(errBar)
+			continue
+		case sparkTimeout:
+			b.WriteString(timeoutBar)
+			continue
+		}
 		idx := len(sparkBars) / 2
 		if rng > 0 {
 			idx = int(int64(d-min) * int64(len(sparkBars)-1) / int64(rng))

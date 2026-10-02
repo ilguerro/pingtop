@@ -2,6 +2,7 @@ package ui
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -281,7 +282,7 @@ func TestFilterCaseInsensitive(t *testing.T) {
 }
 
 func TestFormatSparkEmpty(t *testing.T) {
-	got := formatSpark(nil, sparkWidth)
+	got := formatSpark(nil, sparkWidth, styler{})
 	if got != strings.Repeat(" ", sparkWidth) {
 		t.Errorf("empty history should render as %d spaces, got %q", sparkWidth, got)
 	}
@@ -289,7 +290,7 @@ func TestFormatSparkEmpty(t *testing.T) {
 
 func TestFormatSparkAllEqual(t *testing.T) {
 	h := []time.Duration{10 * time.Millisecond, 10 * time.Millisecond, 10 * time.Millisecond}
-	got := formatSpark(h, sparkWidth)
+	got := formatSpark(h, sparkWidth, styler{})
 	mid := string(sparkBars[len(sparkBars)/2])
 	// Three middle bars, padded on the left to sparkWidth.
 	want := strings.Repeat(" ", sparkWidth-3) + strings.Repeat(mid, 3)
@@ -300,7 +301,7 @@ func TestFormatSparkAllEqual(t *testing.T) {
 
 func TestFormatSparkScalesMinMax(t *testing.T) {
 	h := []time.Duration{1 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond}
-	got := formatSpark(h, sparkWidth)
+	got := formatSpark(h, sparkWidth, styler{})
 	runes := []rune(got)
 	// Last three runes are the data; min should be first bar, max should be last bar.
 	last3 := runes[len(runes)-3:]
@@ -313,9 +314,82 @@ func TestFormatSparkScalesMinMax(t *testing.T) {
 }
 
 func TestFormatSparkRespectsWidth(t *testing.T) {
-	got := formatSpark(nil, 50)
+	got := formatSpark(nil, 50, styler{})
 	if got != strings.Repeat(" ", 50) {
 		t.Errorf("empty history at width=50 should render as 50 spaces, got %d chars", len([]rune(got)))
+	}
+}
+
+func TestFormatSparkErrPlain(t *testing.T) {
+	h := []time.Duration{sparkErr, sparkErr}
+	got := formatSpark(h, sparkWidth, styler{})
+	want := strings.Repeat(" ", sparkWidth-2) + strings.Repeat(sparkErrPlain, 2)
+	if got != want {
+		t.Errorf("error samples should render as %q without color\n got=%q\nwant=%q", sparkErrPlain, got, want)
+	}
+}
+
+func TestFormatSparkErrIgnoredInScaling(t *testing.T) {
+	// The sentinel is negative; it must not become the window's min and
+	// flatten the real samples.
+	h := []time.Duration{1 * time.Millisecond, sparkErr, 100 * time.Millisecond}
+	runes := []rune(formatSpark(h, sparkWidth, styler{}))
+	last3 := runes[len(runes)-3:]
+	if last3[0] != sparkBars[0] {
+		t.Errorf("min sample should map to %c, got %c", sparkBars[0], last3[0])
+	}
+	if string(last3[1]) != sparkErrPlain {
+		t.Errorf("error sample should render as %q, got %c", sparkErrPlain, last3[1])
+	}
+	if last3[2] != sparkBars[len(sparkBars)-1] {
+		t.Errorf("max sample should map to %c, got %c", sparkBars[len(sparkBars)-1], last3[2])
+	}
+}
+
+func TestFormatSparkErrColored(t *testing.T) {
+	old := lipgloss.DefaultRenderer().ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI)
+	defer lipgloss.SetColorProfile(old)
+
+	st := newStyler(true)
+	got := formatSpark([]time.Duration{10 * time.Millisecond, sparkErr}, sparkWidth, st)
+	full := string(sparkBars[len(sparkBars)-1])
+	if !strings.HasSuffix(got, st.render(full, levelCrit)) {
+		t.Errorf("error sample should render as a crit-colored full bar, got %q", got)
+	}
+	if strings.Contains(got, sparkErrPlain) {
+		t.Errorf("colored spark should not use the plain marker, got %q", got)
+	}
+	if w := lipgloss.Width(got); w != sparkWidth {
+		t.Errorf("colored spark should still be %d cells wide, got %d", sparkWidth, w)
+	}
+}
+
+func TestFormatSparkTimeoutPlain(t *testing.T) {
+	h := []time.Duration{1 * time.Millisecond, sparkTimeout, 100 * time.Millisecond}
+	runes := []rune(formatSpark(h, sparkWidth, styler{}))
+	last3 := runes[len(runes)-3:]
+	if last3[0] != sparkBars[0] || last3[2] != sparkBars[len(sparkBars)-1] {
+		t.Errorf("timeout sample should not skew scaling, got %q", string(last3))
+	}
+	if string(last3[1]) != sparkTimeoutPlain {
+		t.Errorf("timeout sample should render as %q, got %c", sparkTimeoutPlain, last3[1])
+	}
+}
+
+func TestFormatSparkTimeoutColored(t *testing.T) {
+	old := lipgloss.DefaultRenderer().ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI)
+	defer lipgloss.SetColorProfile(old)
+
+	st := newStyler(true)
+	got := formatSpark([]time.Duration{10 * time.Millisecond, sparkTimeout}, sparkWidth, st)
+	full := string(sparkBars[len(sparkBars)-1])
+	if !strings.HasSuffix(got, st.render(full, levelWarn)) {
+		t.Errorf("timeout sample should render as a warn-colored full bar, got %q", got)
+	}
+	if w := lipgloss.Width(got); w != sparkWidth {
+		t.Errorf("colored spark should still be %d cells wide, got %d", sparkWidth, w)
 	}
 }
 
@@ -382,6 +456,56 @@ func TestUpdateAppendsHistoryOnRTT(t *testing.T) {
 	out = mm.(Model)
 	if len(out.history["1.1.1.1"]) != 1 {
 		t.Errorf("RTT=0 message should not append, got %v", out.history["1.1.1.1"])
+	}
+}
+
+func TestUpdateAppendsSparkErrOnError(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate, 4)
+	m := New([]string{"1.1.1.1"}, updates, false, false)
+
+	mm, _ := m.Update(statsMsg{TargetID: "1.1.1.1", Sent: 1, LastErr: errors.New("network is unreachable")})
+	out := mm.(Model)
+	if len(out.history["1.1.1.1"]) != 1 || out.history["1.1.1.1"][0] != sparkErr {
+		t.Errorf("expected one sparkErr sample, got %v", out.history["1.1.1.1"])
+	}
+}
+
+func TestUpdateAppendsSparkTimeout(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate, 4)
+	m := New([]string{"1.1.1.1"}, updates, false, false)
+
+	mm, _ := m.Update(statsMsg{TargetID: "1.1.1.1", Sent: 1, Timeout: true})
+	out := mm.(Model)
+	if len(out.history["1.1.1.1"]) != 1 || out.history["1.1.1.1"][0] != sparkTimeout {
+		t.Errorf("expected one sparkTimeout sample, got %v", out.history["1.1.1.1"])
+	}
+}
+
+func TestUpdateEscalatesRepeatedTimeouts(t *testing.T) {
+	updates := make(chan pinger.StatsUpdate, 4)
+	var tm tea.Model = New([]string{"1.1.1.1"}, updates, false, false)
+
+	tm, _ = tm.Update(statsMsg{TargetID: "1.1.1.1", Sent: 1, Recv: 1, RTT: time.Millisecond})
+	for i := 0; i < sparkTimeoutEscalate+1; i++ {
+		tm, _ = tm.Update(statsMsg{TargetID: "1.1.1.1", Timeout: true})
+	}
+	// A reply ends the run, so the next miss is only suspected again.
+	tm, _ = tm.Update(statsMsg{TargetID: "1.1.1.1", RTT: time.Millisecond})
+	tm, _ = tm.Update(statsMsg{TargetID: "1.1.1.1", Timeout: true})
+
+	want := []time.Duration{time.Millisecond}
+	for i := 1; i <= sparkTimeoutEscalate+1; i++ {
+		if i < sparkTimeoutEscalate {
+			want = append(want, sparkTimeout)
+		} else {
+			want = append(want, sparkErr)
+		}
+	}
+	want = append(want, time.Millisecond, sparkTimeout)
+
+	got := tm.(Model).history["1.1.1.1"]
+	if !slices.Equal(got, want) {
+		t.Errorf("history mismatch\n got=%v\nwant=%v", got, want)
 	}
 }
 
