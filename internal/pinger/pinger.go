@@ -27,6 +27,7 @@ type StatsUpdate struct {
 	MaxRTT   time.Duration // largest RTT observed; zero until first reply
 	Jitter   time.Duration // RFC 3550 smoothed inter-packet jitter; zero until 2nd reply
 	LastErr  error         // sticky last error for display; nil on success
+	Timeout  bool          // the previous probe got no reply within one Interval
 	Dropped  bool          // pinger has stopped; UI should remove this target
 }
 
@@ -94,9 +95,13 @@ func (p *Pinger) Run(ctx context.Context) error {
 	// reported is set when a callback has already emitted the error
 	// that ended the current attempt, so it isn't reported twice.
 	var reported atomic.Bool
+	// awaiting is true while the latest probe that left the host has
+	// had no reply yet. Still set at the next send means it timed out.
+	var awaiting atomic.Bool
 
 	onSend := func(*probing.Packet) {
 		n := sent.Add(1)
+		timedOut := awaiting.Swap(true)
 		if p.Drop > 0 && n >= int64(p.Drop) && recv.Load() == 0 {
 			u := snapshot(0, nil)
 			u.Dropped = true
@@ -110,10 +115,12 @@ func (p *Pinger) Run(ctx context.Context) error {
 		// send tick as sent leads recv by one packet.
 		u := snapshot(0, nil)
 		u.Sent = n - 1
+		u.Timeout = timedOut
 		p.emit(pCtx, u)
 	}
 	onRecv := func(pkt *probing.Packet) {
 		recv.Add(1)
+		awaiting.Store(false)
 		rtt := int64(pkt.Rtt)
 		sumRTT.Add(rtt)
 		if cur := minRTT.Load(); rtt < cur {
@@ -157,6 +164,9 @@ func (p *Pinger) Run(ctx context.Context) error {
 		// check stays in OnSend so a local network failure never
 		// evicts targets.
 		sent.Add(1)
+		// This probe never left, so there is nothing to wait for; the
+		// error update already marks the gap.
+		awaiting.Store(false)
 		reported.Store(true)
 		p.emit(pCtx, snapshot(0, err))
 	}
