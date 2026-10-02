@@ -60,6 +60,10 @@ func (p *Pinger) Run(ctx context.Context) error {
 	pp.Size = p.Size
 	pp.RecordRtts = false
 	pp.SetPrivileged(p.Mode == ModePrivileged)
+	// pro-bing's default logger writes to stderr on every failed send,
+	// which scribbles over the alt screen. Errors reach the UI through
+	// OnSendError/OnRecvError instead.
+	pp.SetLogger(probing.NoopLogger{})
 
 	// pCtx lets the pinger stop itself (on drop) without waiting for
 	// the parent ctx, while still inheriting cancellation from it.
