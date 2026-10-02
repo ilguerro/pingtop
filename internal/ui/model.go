@@ -119,8 +119,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.waitForUpdate()
 		}
 		m.stats[msg.TargetID] = pinger.StatsUpdate(msg)
-		if msg.RTT > 0 {
+		switch {
+		case msg.RTT > 0:
 			appendHistory(m.history, msg.TargetID, msg.RTT)
+		case msg.LastErr != nil:
+			appendHistory(m.history, msg.TargetID, sparkErr)
 		}
 		return m, m.waitForUpdate()
 
