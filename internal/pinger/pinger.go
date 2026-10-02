@@ -46,25 +46,16 @@ type Pinger struct {
 // emitting a StatsUpdate after each send, receive, or recv error. A
 // resolver/socket setup failure is emitted as a StatsUpdate with
 // LastErr set and then returned, so the UI shows the row in an errored
-// state rather than silently absent.
+// state rather than silently absent. Any later network error is
+// reported the same way and the probe loop is restarted, so the target
+// recovers on its own once the network is back.
 func (p *Pinger) Run(ctx context.Context) error {
-	pp, err := probing.NewPinger(p.Host)
+	resolved, err := probing.NewPinger(p.Host)
 	if err != nil {
 		p.emit(ctx, StatsUpdate{TargetID: p.ID, LastErr: fmt.Errorf("resolve: %w", err)})
 		return err
 	}
-	pp.Interval = p.Interval
-	// pro-bing always builds a time.NewTicker from Timeout and panics on
-	// zero. We never want it to fire — ctx-cancel triggers Stop() — so
-	// set it to the maximum representable duration.
-	pp.Timeout = time.Duration(math.MaxInt64)
-	pp.Size = p.Size
-	pp.RecordRtts = false
-	pp.SetPrivileged(p.Mode == ModePrivileged)
-	// pro-bing's default logger writes to stderr on every failed send,
-	// which scribbles over the alt screen. Errors reach the UI through
-	// OnSendError/OnRecvError instead.
-	pp.SetLogger(probing.NoopLogger{})
+	addr := resolved.IPAddr()
 
 	// pCtx lets the pinger stop itself (on drop) without waiting for
 	// the parent ctx, while still inheriting cancellation from it.
@@ -100,7 +91,11 @@ func (p *Pinger) Run(ctx context.Context) error {
 		}
 	}
 
-	pp.OnSend = func(*probing.Packet) {
+	// reported is set when a callback has already emitted the error
+	// that ended the current attempt, so it isn't reported twice.
+	var reported atomic.Bool
+
+	onSend := func(*probing.Packet) {
 		n := sent.Add(1)
 		if p.Drop > 0 && n >= int64(p.Drop) && recv.Load() == 0 {
 			u := snapshot(0, nil)
@@ -117,7 +112,7 @@ func (p *Pinger) Run(ctx context.Context) error {
 		u.Sent = n - 1
 		p.emit(pCtx, u)
 	}
-	pp.OnRecv = func(pkt *probing.Packet) {
+	onRecv := func(pkt *probing.Packet) {
 		recv.Add(1)
 		rtt := int64(pkt.Rtt)
 		sumRTT.Add(rtt)
@@ -140,7 +135,7 @@ func (p *Pinger) Run(ctx context.Context) error {
 		}
 		p.emit(pCtx, snapshot(pkt.Rtt, nil))
 	}
-	pp.OnRecvError = func(err error) {
+	onRecvError := func(err error) {
 		// pro-bing's recv loop fires OnRecvError on every read
 		// deadline tick as part of its normal poll cycle. Those
 		// aren't real failures; ignore them so the UI doesn't
@@ -148,9 +143,10 @@ func (p *Pinger) Run(ctx context.Context) error {
 		if errors.Is(err, os.ErrDeadlineExceeded) {
 			return
 		}
+		reported.Store(true)
 		p.emit(pCtx, snapshot(0, err))
 	}
-	pp.OnSendError = func(_ *probing.Packet, err error) {
+	onSendError := func(_ *probing.Packet, err error) {
 		// pro-bing retries ENOBUFS immediately in a tight loop, so it
 		// isn't a lost probe yet.
 		if errors.Is(err, syscall.ENOBUFS) {
@@ -161,16 +157,49 @@ func (p *Pinger) Run(ctx context.Context) error {
 		// check stays in OnSend so a local network failure never
 		// evicts targets.
 		sent.Add(1)
+		reported.Store(true)
 		p.emit(pCtx, snapshot(0, err))
 	}
 
-	// pro-bing.Run() blocks until Stop is called. Translate ctx cancel
-	// into Stop, then let Run return naturally.
-	go func() {
-		<-pCtx.Done()
-		pp.Stop()
-	}()
-	return pp.Run()
+	// pro-bing gives up on the first failed send and on any hard recv
+	// error, and a stopped pinger can't be re-run. Build a fresh one
+	// per attempt (reusing the resolved address) and keep going until
+	// pCtx is cancelled; the counters above carry across attempts.
+	for {
+		pp := probing.New(p.Host)
+		pp.SetIPAddr(addr)
+		pp.Interval = p.Interval
+		// pro-bing always builds a time.NewTicker from Timeout and panics
+		// on zero. We never want it to fire — pCtx ends the run — so set
+		// it to the maximum representable duration.
+		pp.Timeout = time.Duration(math.MaxInt64)
+		pp.Size = p.Size
+		pp.RecordRtts = false
+		pp.SetPrivileged(p.Mode == ModePrivileged)
+		// pro-bing's default logger writes to stderr on every failed
+		// send, which scribbles over the alt screen. Errors reach the UI
+		// through OnSendError/OnRecvError instead.
+		pp.SetLogger(probing.NoopLogger{})
+		pp.OnSend = onSend
+		pp.OnRecv = onRecv
+		pp.OnRecvError = onRecvError
+		pp.OnSendError = onSendError
+
+		reported.Store(false)
+		err := pp.RunWithContext(pCtx)
+		if pCtx.Err() != nil {
+			return nil
+		}
+		// Socket setup failures have no callback; surface them here.
+		if err != nil && !reported.Load() {
+			p.emit(pCtx, snapshot(0, err))
+		}
+		select {
+		case <-pCtx.Done():
+			return nil
+		case <-time.After(p.Interval):
+		}
+	}
 }
 
 // emit sends an update with bounded blocking. A full channel only
